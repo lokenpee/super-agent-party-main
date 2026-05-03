@@ -687,7 +687,7 @@ const app = Vue.createApp({
       if (isElectron && window.electronAPI?.onGlobalShortcutTriggered) {
           window.electronAPI.onGlobalShortcutTriggered(async () => {
             // 只有启用了 ASR 且模式为全局快捷键时才生效
-            if (this.asrSettings.interactionMethod !== 'globalKeyTriggered') return;
+            if (!this.asrSettings.enabled || this.asrSettings.interactionMethod !== 'globalKeyTriggered') return;
 
             if (!this.isGlobalRecording) {
               // 第 1 次按下组合键：开始录音

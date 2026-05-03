@@ -398,6 +398,7 @@ locales = {}
 sleep_guard = None
 scheduler_task = None
 global_http_client = None  # 用于共享底层的 TCP 连接池
+tts_http_client = None  # TTS 专用客户端，不带代理（避免国内 TTS API 走代理失败）
 openai_tts_clients_cache = {}  # 缓存 OpenAI TTS Client
 tetos_speakers_cache = {}      # 缓存 Tetos Speaker 对象
 openai_asr_clients_cache = {}
@@ -689,7 +690,7 @@ async def lifespan(app: FastAPI):
     )
     
     # 2. 解包结果
-    global settings, client, reasoner_client, fast_client, mcp_client_list, local_timezone, logger, locales, global_http_client,scheduler_task,sleep_guard
+    global settings, client, reasoner_client, fast_client, mcp_client_list, local_timezone, logger, locales, global_http_client, tts_http_client, scheduler_task, sleep_guard
     _, _, locales, settings, local_timezone = results
     
     from py.sleep_guard import SleepGuard
@@ -756,6 +757,11 @@ async def lifespan(app: FastAPI):
         timeout=timeout_config,
         proxy=proxy_url,
         trust_env=trust_env
+    )
+    tts_http_client = httpx.AsyncClient(
+        timeout=timeout_config,
+        proxy=None,  # TTS 不走代理（国内 API 或本地服务走代理会连不上）
+        trust_env=False
     )
 
     # --- [模型 Client 初始化] ---
@@ -873,6 +879,8 @@ async def lifespan(app: FastAPI):
         
     if global_http_client:
         await global_http_client.aclose()
+    if tts_http_client:
+        await tts_http_client.aclose()
     print("All processes terminated.")
 
 
@@ -8147,6 +8155,38 @@ async def broadcast_to_vrm(self, message: Union[str, bytes]):
 
 from py.vts_manager import vts_instance
 
+def clean_tts_text(text: str) -> str:
+    """移除 TTS 不需要朗读的内容：中文括号动作描写、颜文字、emoji"""
+    # 1. 移除中文括号及其内容（动作/场景描写）
+    text = re.sub(r'（[^）]*）', '', text)
+    # 2. 移除英文括号中的颜文字 — 括号内不含字母/CJK/数字则视为纯符号颜文字
+    def replace_kaomoji(m):
+        inner = m.group(1)
+        if re.search(r'[a-zA-Z一-龥぀-ゟ゠-ヿ가-힯\d]', inner):
+            return m.group(0)
+        return ''
+    text = re.sub(r'\(([^)]*)\)', replace_kaomoji, text)
+    # 3. 移除 emoji 字符
+    emoji_pat = re.compile(
+        '[\U0001F600-\U0001F64F'
+        '\U0001F300-\U0001F5FF'
+        '\U0001F680-\U0001F6FF'
+        '\U0001F900-\U0001F9FF'
+        '\U0001FA00-\U0001FA6F'
+        '\U0001FA70-\U0001FAFF'
+        '\U00002702-\U000027B0'
+        '\U0001F1E0-\U0001F1FF'
+        '\U00002600-\U000027BF'
+        '\U0000FE00-\U0000FE0F'
+        '\U0000200D'
+        '\U000020E3'
+        ']', re.UNICODE)
+    text = emoji_pat.sub('', text)
+    # 4. 清理多余空白和首尾标点符号
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = text.strip('，。！？、…~,.;:!?*#@$%^&')
+    return text
+
 @app.websocket("/ws/tts")
 async def tts_websocket_endpoint(websocket: WebSocket):
     await tts_manager.connect_main(websocket)
@@ -8285,14 +8325,17 @@ async def text_to_speech(request: Request):
     import subprocess
     
     # 声明全局缓存和客户端
-    global global_http_client, openai_tts_clients_cache, tetos_speakers_cache
+    global global_http_client, tts_http_client, openai_tts_clients_cache, tetos_speakers_cache
 
     try:
         data = await request.json()
         text = data.get('text', '')
         if not text:
             return JSONResponse(status_code=400, content={"error": "Text is empty"})
-        
+        text = clean_tts_text(text)
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "Text is empty after cleaning"})
+
         # 移动端专用：强制使用opus格式
         mobile_optimized = data.get('mobile_optimized', False)
         target_format = "opus" if mobile_optimized else data.get('format', 'mp3')
@@ -8397,8 +8440,8 @@ async def text_to_speech(request: Request):
             async def generate_audio():
                 safe_url = sanitize_url(input_url=custom_tt_server, default_base="http://127.0.0.1:9880", endpoint="")
                 try:
-                    # 使用全局客户端，无需 async with httpx.AsyncClient()
-                    async with global_http_client.stream("GET", safe_url, params=params) as response:
+                    # 使用无代理的 TTS 客户端（避免代理导致连接失败）
+                    async with tts_http_client.stream("GET", safe_url, params=params) as response:
                         response.raise_for_status()
                         if custom_streaming:
                             async for chunk in response.aiter_bytes():
@@ -8441,7 +8484,7 @@ async def text_to_speech(request: Request):
             async def generate_audio():
                 safe_url = sanitize_url(input_url=gsvServer, default_base="http://127.0.0.1:9880", endpoint="/tts")
                 try:
-                    async with global_http_client.stream("POST", safe_url, json=gsv_params) as response:
+                    async with tts_http_client.stream("POST", safe_url, json=gsv_params) as response:
                         response.raise_for_status()
                         async for chunk in response.aiter_bytes():
                             yield chunk
@@ -8515,23 +8558,43 @@ async def text_to_speech(request: Request):
             
             async def generate_audio():
                 response_format = target_format if target_format in ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm'] else 'mp3'
-                params = {'model': tts_settings.get('model', 'tts-1'), 'input': text, 'speed': max(0.25, min(4.0, speed)), 'response_format': response_format}
-                
                 ref_audio = tts_settings.get('gsvRefAudioPath', '')
+
                 if ref_audio:
-                    audio_file_path = os.path.join(UPLOAD_FILES_DIR, ref_audio)
-                    audio_base64 = base64.b64encode(open(audio_file_path, "rb").read()).decode('utf-8')
-                    params['extra_body'] = {"references": [{"text": tts_settings.get('gsvPromptText', ''), "audio": f"data:audio/{Path(audio_file_path).suffix[1:]};base64,{audio_base64}"}]}
+                    # 硅基流动等 API 不允许同时传 voice 和 references，绕过 OpenAI SDK 直接发原始 HTTP 请求
+                    body = {
+                        'model': tts_settings.get('model', 'tts-1'),
+                        'input': text,
+                        'speed': max(0.25, min(4.0, speed)),
+                        'response_format': response_format,
+                        'references': [{
+                            'text': tts_settings.get('gsvPromptText', ''),
+                            'audio': f"data:audio/{Path(ref_audio).suffix[1:]};base64,{base64.b64encode(open(os.path.join(UPLOAD_FILES_DIR, ref_audio), 'rb').read()).decode('utf-8')}"
+                        }]
+                    }
+                    tts_url = base_url.rstrip('/') + '/audio/speech'
+                    if tts_settings.get('openaiStream', False):
+                        async with tts_http_client.stream('POST', tts_url, json=body, headers={'Authorization': f'Bearer {api_key}'}) as resp:
+                            resp.raise_for_status()
+                            async for chunk in resp.aiter_bytes(chunk_size=4096):
+                                yield chunk
+                    else:
+                        resp = await tts_http_client.post(tts_url, json=body, headers={'Authorization': f'Bearer {api_key}'})
+                        resp.raise_for_status()
+                        content = resp.content
+                        for i in range(0, len(content), 4096):
+                            yield content[i:i + 4096]
                 else:
+                    params = {'model': tts_settings.get('model', 'tts-1'), 'input': text, 'speed': max(0.25, min(4.0, speed)), 'response_format': response_format}
                     params['voice'] = tts_settings.get('openaiVoice', 'alloy')
 
-                if tts_settings.get('openaiStream', False):
-                    async with client.audio.speech.with_streaming_response.create(**params) as response:
-                        async for chunk in response.iter_bytes(chunk_size=4096): yield chunk
-                else:
-                    response = await client.audio.speech.create(**params)
-                    content = await response.aread()
-                    for i in range(0, len(content), 4096): yield content[i:i + 4096]
+                    if tts_settings.get('openaiStream', False):
+                        async with client.audio.speech.with_streaming_response.create(**params) as response:
+                            async for chunk in response.iter_bytes(chunk_size=4096): yield chunk
+                    else:
+                        response = await client.audio.speech.create(**params)
+                        content = await response.aread()
+                        for i in range(0, len(content), 4096): yield content[i:i + 4096]
 
             media_map = {"opus": "audio/ogg", "wav": "audio/wav", "aac": "audio/aac", "flac": "audio/flac"}
             return StreamingResponse(generate_audio(), media_type=media_map.get(target_format, "audio/mpeg"))

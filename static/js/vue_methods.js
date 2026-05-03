@@ -2180,7 +2180,7 @@ let vue_methods = {
       await window.electronAPI.unregisterGlobalShortcut();
 
       // 如果启用了 ASR 且为全局快捷键模式
-      if (this.asrSettings.interactionMethod === 'globalKeyTriggered') {
+      if (this.asrSettings.enabled && this.asrSettings.interactionMethod === 'globalKeyTriggered') {
         const globalKeyCombo = this.getGlobalAccelerator(this.asrSettings.hotkey);
         
         const success = await window.electronAPI.registerGlobalShortcut(globalKeyCombo);
@@ -2206,7 +2206,7 @@ let vue_methods = {
       if (event.isComposing || event.keyCode === 229) return;
 
       // ====== 局部模式 (按住说话) ======
-      if (this.asrSettings.interactionMethod === "keyTriggered") {
+      if (this.asrSettings.enabled && this.asrSettings.interactionMethod === "keyTriggered") {
         // 如果按下的键和设置的键严格匹配 (例如 'Alt' === 'Alt')
         if (event.key === this.asrSettings.hotkey) {
           event.preventDefault(); 
@@ -2251,7 +2251,7 @@ let vue_methods = {
       if (event?.repeat) return;
 
       // ====== 局部模式 (松开结束) ======
-      if (this.asrSettings.interactionMethod === "keyTriggered") {
+      if (this.asrSettings.enabled && this.asrSettings.interactionMethod === "keyTriggered") {
         if (event.key === this.asrSettings.hotkey) {
           event.preventDefault();
           await this.handlePttRelease(event); // 结束录音
@@ -2708,6 +2708,7 @@ let vue_methods = {
         const audioPromise = new Promise((resolve) => { audioResolve = resolve; });
         
         if (this.ttsSettings.enabled) {
+            this.ttsActionParenDepth = 0;  // 重置括号深度追踪
             this.startTTSProcess(currentMsg);
             this.startAudioPlayProcess(currentMsg, audioResolve);
             audioProcess = audioPromise;
@@ -8829,7 +8830,22 @@ handleCreateSlackSeparator(val) {
      * }
      */
     splitTTSBuffer(buffer) {
-        // 0. 基础清理逻辑 (保持不变)
+        // 0. 基础清理逻辑
+        // 0a. 状态追踪：跨 chunk 移除中文括号动作描写（流式场景下括号可能跨多个分片）
+        if (this.ttsActionParenDepth === undefined) this.ttsActionParenDepth = 0;
+        let stripped = '';
+        for (let i = 0; i < buffer.length; i++) {
+            const ch = buffer[i];
+            if (ch === '（') {
+                this.ttsActionParenDepth++;
+            } else if (ch === '）') {
+                if (this.ttsActionParenDepth > 0) this.ttsActionParenDepth--;
+            } else if (this.ttsActionParenDepth === 0) {
+                stripped += ch;
+            }
+        }
+        buffer = stripped;
+        // 0b. 其余清理
         buffer = buffer
             .replace(/#{1,6}\s/gm, '')
             .replace(/[*~`]+/g, '')
@@ -8837,7 +8853,12 @@ handleCreateSlackSeparator(val) {
             .replace(/[\u{2600}-\u{27BF}\u{2700}-\u{27BF}\u{1F300}-\u{1F9FF}]/gu, '')
             .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
             .replace(/!\[.*?\]\(.*?\)/g, '')
-            .replace(/\[(.*?)\]\(.*?\)/g, '$1');
+            .replace(/\[(.*?)\]\(.*?\)/g, '$1')
+            // 移除英文括号中的颜文字（不含字母/CJK/数字则视为颜文字）
+            .replace(/\(([^)]*)\)/gu, (m, inner) => {
+                if (/[a-zA-Z一-龥぀-ゟ゠-ヿ가-힯\d]/.test(inner)) return m;
+                return '';
+            });
 
         if (!buffer) {
             return {
