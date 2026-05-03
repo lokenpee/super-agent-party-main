@@ -6,7 +6,9 @@
       "Bash(sqlite3 \"C:\\\\Users\\\\m1767\\\\AppData\\\\Roaming\\\\Super-Agent-Party\\\\Super-Agent-Party\\\\super_agent_party.db\" \"SELECT json_extract\\(data, '$.ttsSettings.engine'\\) as engine, json_extract\\(data, '$.ttsSettings.base_url'\\) as base_url, json_extract\\(data, '$.ttsSettings.api_key'\\) as api_key, json_extract\\(data, '$.ttsSettings.model'\\) as model, json_extract\\(data, '$.ttsSettings.openaiVoice'\\) as voice FROM settings LIMIT 1;\")",
       "Bash(sqlite3 \"C:\\\\Users\\\\m1767\\\\AppData\\\\Roaming\\\\Super-Agent-Party\\\\Super-Agent-Party\\\\super_agent_party.db\" \"SELECT json_extract\\(data, '$.asrSettings.enabled'\\) as enabled, json_extract\\(data, '$.asrSettings.interactionMethod'\\) as method, json_extract\\(data, '$.asrSettings.hotkey'\\) as hotkey FROM settings LIMIT 1;\")",
       "Bash(pip list *)",
-      "Bash(python -X utf8 -c ' *)"
+      "Bash(python -X utf8 -c ' *)",
+      "Bash(awk -F: '$1 <= 5276 {last=$0} END{print last}')",
+      "WebSearch"
     ]
   }
 }

@@ -344,6 +344,10 @@ class TelegramClient:
 
             # 传统 TTS (如果没有 Omni 音频且开启了 TTS)
             if self.enableTTS and assistant_text and not has_omni_audio:
+                # 先发送完整文字，再发送语音
+                clean_text = self._clean_text(assistant_text)
+                if clean_text:
+                    await self._send_text(chat_id, clean_text)
                 await self._send_voice(chat_id, assistant_text)
                 
         except Exception as e:
